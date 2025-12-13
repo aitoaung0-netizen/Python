@@ -37,7 +37,7 @@ def keep_alive():
     t.start()
 
 # --- 2. CONFIGS ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = "7778399973:AAFSMO3iMBhxb0CG6OOd09lJ7AgBH6CqT_o"
 GOOGLE_CX_ID = os.getenv("GOOGLE_CX_ID")
 GEMINI_KEYS = os.getenv("GEMINI_API_KEYS").split(',') if os.getenv("GEMINI_API_KEYS") else []
 SEARCH_KEYS = os.getenv("GOOGLE_SEARCH_API_KEYS").split(',') if os.getenv("GOOGLE_SEARCH_API_KEYS") else []

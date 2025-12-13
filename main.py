@@ -22,7 +22,7 @@ BOT_TOKEN = os.environ.get("TELERAM_TOKEN")
 
 # Setup Logging & Model
 logging.basicConfig(level=logging.INFO)
-MODEL_NAME = "gemini-1.5-flash" 
+MODEL_NAME = "gemini-2.5-flash" 
 
 # Active Keys Storage
 ACTIVE_GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS if k.strip()]

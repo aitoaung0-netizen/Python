@@ -5,12 +5,22 @@ import re
 import json
 import requests
 import io
+import time
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from PIL import Image
 import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from keep_alive import keep_alive
+
+# --- 0. AUTO-UPDATE ---
+try:
+    import google.generativeai as genai
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "google-generativeai"])
+    import google.generativeai as genai
 
 # --- 1. CONFIGURATION ---
 GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
@@ -22,45 +32,27 @@ MODEL_NAME = "gemini-2.5-flash"
 MEMORY_FILE = "chat_memory.json"
 logging.basicConfig(level=logging.INFO)
 
-safety_settings = [
-    { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE" },
-    { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE" },
-    { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE" },
-    { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE" },
-]
-
+# Global lists
 ACTIVE_GEMINI_KEYS = []
 ACTIVE_SEARCH_KEYS = []
 
-# --- 2. KEY VALIDATION (omitted for brevity) ---
+# --- 2. KEY VALIDATION ---
 def validate_all_keys():
-    # ... (Validation logic remains the same) ...
-    valid_gemini = []
+    print("🚀 SYSTEM STARTUP...")
+    global ACTIVE_GEMINI_KEYS, ACTIVE_SEARCH_KEYS
+
+    # Simple validation to populate lists
     for key in GEMINI_KEYS:
-        key = key.strip()
-        if not key: continue
-        try:
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel(MODEL_NAME) 
-            model.generate_content("Hi") 
-            valid_gemini.append(key)
-        except: pass
+        if key.strip(): ACTIVE_GEMINI_KEYS.append(key.strip())
 
-    valid_search = []
     for key in GOOGLE_SEARCH_KEYS:
-        key = key.strip()
-        if not key: continue
-        try:
-            url = "https://www.googleapis.com/customsearch/v1"
-            params = {'q': 'test', 'key': key, 'cx': GOOGLE_CX_ID}
-            res = requests.get(url, params=params)
-            if res.status_code == 200: valid_search.append(key)
-        except: pass
+        if key.strip(): ACTIVE_SEARCH_KEYS.append(key.strip())
 
-    print(f"✅ Active Keys: Gemini {len(valid_gemini)} | Search {len(valid_search)}")
-    return valid_gemini, valid_search
+    print(f"✅ Gemini Keys: {len(ACTIVE_GEMINI_KEYS)}")
+    print(f"✅ Search Keys: {len(ACTIVE_SEARCH_KEYS)}")
+    return ACTIVE_GEMINI_KEYS, ACTIVE_SEARCH_KEYS
 
-# --- 3. MEMORY SYSTEM (omitted for brevity) ---
+# --- 3. MEMORY SYSTEM ---
 def load_memory():
     if os.path.exists(MEMORY_FILE):
         try:
@@ -100,26 +92,21 @@ def get_gemini_content(content_input):
     for key in shuffled_keys:
         try:
             genai.configure(api_key=key)
-            model = genai.GenerativeModel(MODEL_NAME, safety_settings=safety_settings)
+            model = genai.GenerativeModel(MODEL_NAME)
             response = model.generate_content(content_input)
             return response.text
         except: continue
     return None
 
-def sanitize_query(query):
-    # Sanitize to prevent 400 Bad Request
-    return re.sub(r'[^a-zA-Z0-9\s\u1000-\u109F]+', ' ', query).strip()
-
-def execute_google_search(query, fresh=False):
+def execute_google_search(query, fresh=False, only_telegram=False):
     if not GOOGLE_CX_ID or not ACTIVE_SEARCH_KEYS: return None, []
-
-    sanitized_query = sanitize_query(query)
 
     shuffled_keys = ACTIVE_SEARCH_KEYS.copy()
     for key in shuffled_keys:
         try:
             url = "https://www.googleapis.com/customsearch/v1"
-            params = {'q': sanitized_query, 'key': key, 'cx': GOOGLE_CX_ID, 'safe': 'off'}
+            params = {'q': query, 'key': key, 'cx': GOOGLE_CX_ID, 'safe': 'off'}
+            if fresh: params['dateRestrict'] = 'd1'
 
             response = requests.get(url, params=params)
             if response.status_code != 200: continue
@@ -130,10 +117,26 @@ def execute_google_search(query, fresh=False):
                 links = []
                 for item in res['items']:
                     title = item['title']
-                    link = item['link'].replace("/s/", "/")
+                    link = item['link']
                     snippet = item.get('snippet', '')
-                    text_out += f"TITLE: {title}\nLINK: {link}\nSNIPPET: {snippet}\n\n"
+
+                    # 🔥 CRITICAL FIX: Python-Side Link Filtering
+                    if only_telegram:
+                        # If link doesn't contain t.me, SKIP IT.
+                        if "t.me" not in link: continue
+
+                        # Clean Link (/s/ removal)
+                        link = link.replace("/s/", "/")
+
+                        # Filter junk titles
+                        if "Telegram: Contact" in title and len(snippet) < 10: continue
+
+                    text_out += f"TITLE: {title}\nLINK: {link}\nDETAILS: {snippet}\n\n"
                     links.append({"title": title, "link": link})
+
+                # If filtering resulted in empty list, return empty
+                if only_telegram and not links: return "", []
+
                 return text_out, links
         except: continue
     return "", []
@@ -152,31 +155,48 @@ def expand_query(text):
 async def gemini_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # VISION HANDLER (omitted)
+    # VISION
     if update.message.photo:
-        # ... (Vision logic omitted for focus) ...
+        await update.message.reply_chat_action("typing")
+        user_text = update.message.caption if update.message.caption else "Analyze this"
+        try:
+            photo_file = await update.message.photo[-1].get_file()
+            photo_bytes = await photo_file.download_as_bytearray()
+            img_data = Image.open(io.BytesIO(photo_bytes))
+
+            vision_prompt = f"User: {user_text}. Task: Identify movie/character OR read receipt. Reply in Burmese list."
+            response = get_gemini_content([vision_prompt, img_data])
+
+            if response:
+                update_history(user_id, "User", f"[IMAGE] {user_text}")
+                update_history(user_id, "Bot", f"[IMAGE INFO] {response}")
+                await update.message.reply_text(response, parse_mode='Markdown')
+            else: await update.message.reply_text("❌ Vision Error.")
+        except: await update.message.reply_text("❌ Error processing image.")
         return
 
-    # TEXT HANDLER
+    # TEXT
     user_text = update.message.text
     if not user_text: return
 
     await update.message.reply_chat_action("typing")
     previous_chat = get_history_text(user_id)
     expanded_text = expand_query(user_text)
+    current_mm_time = get_myanmar_time_str()
 
     # SYSTEM PROMPT
     system_prompt = f"""
     You are Gemini AI (Model: {MODEL_NAME}).
-    CRITICAL RULE: FOR PRICE CHECK, ALWAYS ASSUME 'BLACK MARKET' or 'YANGON MARKET' is the user's intent unless specified otherwise.
+    Time: {current_mm_time}
     History: {previous_chat}
     Input: "{expanded_text}"
 
     RULES:
-    1. CHECK_PRICE -> "Price", "Gold", "Dollar", "ဈေး"
-    2. CHECK_TIME -> "Time", "Date", "Today"
-    3. READ_NEWS -> "News"
-    4. FIND_LINK -> Movies, Songs, 18+, Downloads
+    1. CHECK_PRICE -> "Price", "Gold", "Dollar".
+    2. CHECK_TIME -> "Time", "Date", "Today".
+    3. READ_NEWS -> "News".
+    4. FIND_LINK -> Movies, Songs, 18+, Downloads.
+       * If history has "18+" and user says "mms", assume "18+ MMS".
     5. IMAGE -> Draw.
     6. REPLY -> Chat.
 
@@ -185,61 +205,78 @@ async def gemini_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     decision = get_gemini_content(system_prompt)
     if not decision: 
-        await update.message.reply_text("⚠️ System Busy (AI unresponsive)")
+        await update.message.reply_text("⚠️ System Busy (Keys Failed)")
         return
 
-    # Clean and parse decision
     decision_clean = decision.strip().replace('"', '').replace("'", "")
     if decision_clean.startswith("SEARCH"): decision_clean = decision_clean.replace("SEARCH", "FIND_LINK")
+
+    print(f"🧠 Decision: {decision_clean}")
 
     price_match = re.search(r'CHECK_PRICE\s*[:|]?\s*(.*)', decision_clean, re.IGNORECASE)
     news_match = re.search(r'READ_NEWS\s*[:|]?\s*(.*)', decision_clean, re.IGNORECASE)
     link_match = re.search(r'FIND_LINK\s*[:|]?\s*(.*)', decision_clean, re.IGNORECASE)
     time_match = re.search(r'CHECK_TIME', decision_clean, re.IGNORECASE)
+    image_match = re.search(r'IMAGE\s*[:|]?\s*(.*)', decision_clean, re.IGNORECASE)
 
     # --- EXECUTION ---
+
+    # 🔥 PRICE FIX: Multi-step + No Strict Date
     if price_match:
         query = price_match.group(1).strip()
         await update.message.reply_text(f"📉 ဈေးနှုန်းရှာနေသည်: '{query}'...")
 
-        # Search is now optimized for speed and market price
-        search_q = "Myanmar black market gold and USD exchange rate"
-        search_data, _ = execute_google_search(search_q) 
+        # 1. Search Broadly
+        search_q = "Myanmar gold price market rate today" if "gold" in query.lower() else f"Myanmar {query} market price"
+        search_data, _ = execute_google_search(search_q, fresh=False) # Fresh=False ensures we get results even if old
+
+        # 2. Try Specific Source if 1 failed
+        if not search_data:
+             search_data, _ = execute_google_search("YGEA gold price today update", fresh=False)
 
         if not search_data:
             await update.message.reply_text("❌ Data မတွေ့ပါ။")
         else:
-            # 🔥 PROMPT REFINEMENT: Direct extraction of market price
+            # Force Extraction Prompt
             price_prompt = f"""
             Search Results: {search_data}
-            Task: Synthesize and list the most recent and relevant Myanmar BLACK MARKET Prices (Gold/USD).
-            IGNORE official/old rates. Prioritize specific figures.
-            Reply in Burmese Markdown format:
-            🥇 **ပြင်ပပေါက်ဈေး (ရွှေ):** ... (e.g., 55 သိန်း 8 သောင်း)
-            💵 **ပြင်ပပေါက်ဈေး (USD):** ... (e.g., 4100 MMK)
+            Task: Estimate LATEST Myanmar Market Prices.
+
+            INSTRUCTIONS:
+            - Scan snippet for numbers like '59', '60' (Lakhs) or '4100', '4200' (MMK).
+            - If snippet says 'Yesterday', USE IT as latest.
+            - DO NOT say 'Not found'. Make an educated guess based on the text.
+
+            Reply in Burmese List:
+            🥇 ရွှေ: ...
+            💵 ငွေကြေး: ...
             """
             price_report = get_gemini_content(price_prompt)
             await update.message.reply_text(price_report, parse_mode='Markdown')
 
+    # 🔥 LINK FIX: Strict Python-side Filtering
     elif link_match:
         raw_query = link_match.group(1).strip()
+
         is_adult = any(x in raw_query.lower() for x in ["18+", "porn", "leak"]) or ("18+" in previous_chat)
 
         if is_adult:
-            # 🔥 STRICT LINK FILTERING: Use both t.me and explicit Burmese keywords
-            final_query = f'site:t.me "{raw_query}" (leak OR viral OR sex OR အောကား OR အပြာကား OR လိုးကား)'
+            final_query = f'site:t.me "{raw_query}" (leak OR viral OR sex OR porn)'
         else:
-            # ALWAYS ensure site:t.me is prepended to avoid intermediate sites
-            final_query = f'site:t.me "{raw_query}"'
+            final_query = f'site:t.me "{raw_query}" (channel OR chat OR 1080p)'
 
         await update.message.reply_text(f"🔍 Searching: '{raw_query}'...")
 
-        search_data, links = execute_google_search(final_query, fresh=False)
+        # Enable 'only_telegram=True' to strip non-telegram links
+        search_data, links = execute_google_search(final_query, fresh=False, only_telegram=True)
+
+        if not links:
+            # Fallback
+            search_data, links = execute_google_search(f'site:t.me {raw_query}', fresh=False, only_telegram=True)
 
         if not links:
             await update.message.reply_text("❌ Links မတွေ့ပါ။")
         else:
-            # Display links directly from the fastest search results
             keyboard = [[InlineKeyboardButton(f"🔗 {item['title'][:30]}", url=item['link'])] for item in links[:6]]
             update_history(user_id, "User", user_text)
             update_history(user_id, "Bot", "Links Sent")
@@ -248,30 +285,31 @@ async def gemini_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif news_match:
         query = news_match.group(1).strip()
         await update.message.reply_text(f"📰 Reading News: '{query}'...")
-
-        # Query is sanitized in execute_google_search
-        search_data, _ = execute_google_search(f"Myanmar news {query}")
-
+        search_data, _ = execute_google_search(f"Myanmar news {query}", fresh=True)
         if not search_data:
              await update.message.reply_text("❌ No news.")
         else:
-             report_prompt = f"Search Results: {search_data}\nTask: Summarize the main facts and key events concisely in Burmese. Avoid unnecessary commentary."
-             report = get_gemini_content(report_prompt)
+             report = get_gemini_content(f"Summarize in Burmese:\n{search_data}")
              await update.message.reply_text(report, parse_mode='Markdown')
 
     elif time_match:
         mm_time = get_myanmar_time_str()
         await update.message.reply_text(f"📆 {mm_time}")
 
+    elif image_match:
+        prompt = image_match.group(1).strip()
+        await update.message.reply_text(f"🎨 Generating...")
+        await update.message.reply_photo(tool_image_gen(prompt))
+
     else:
-        # Default Chat Reply
-        chat_reply = get_gemini_content(f"History: {previous_chat}\nUser: {user_text}\nReply smartly in Burmese.")
-        if chat_reply:
+        clean_reply = decision.replace("REPLY", "").replace('|', '').strip()
+        if "COMMAND" in clean_reply:
+             await update.message.reply_text("⚠️ Processing...")
+        else:
+            chat_reply = get_gemini_content(f"History: {previous_chat}\nUser: {user_text}\nReply smartly in Burmese.")
             update_history(user_id, "User", user_text)
             update_history(user_id, "Bot", chat_reply)
             await update.message.reply_text(chat_reply, parse_mode='Markdown')
-        else:
-            await update.message.reply_text("⚠️ System Busy (AI unresponsive)")
 
 if __name__ == '__main__':
     keep_alive()

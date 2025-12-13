@@ -1,10 +1,11 @@
 import logging
 import os
 import random
-import re
 import json
+import re
 import requests
 import io
+import asyncio
 from datetime import datetime, timedelta, timezone
 from PIL import Image
 import google.generativeai as genai
@@ -12,221 +13,257 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constan
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from keep_alive import keep_alive
 
-# --- 1. CONFIGURATION ---
+# --- 1. SYSTEM CONFIGURATION ---
+# Load Environment Variables
 GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
 GOOGLE_SEARCH_KEYS = os.environ.get("GOOGLE_SEARCH_API_KEYS", "").split(",")
 GOOGLE_CX_ID = os.environ.get("GOOGLE_CX_ID", "")
 BOT_TOKEN = os.environ.get("TELERAM_TOKEN")
 
-# 🔥 USE "PRO" MODEL IF AVAILABLE, ELSE FLASH (For better reasoning)
-MODEL_NAME = "gemini-2.5-flash" 
-MEMORY_FILE = "chat_memory.json"
-
+# Setup Logging & Model
 logging.basicConfig(level=logging.INFO)
+MODEL_NAME = "gemini-1.5-flash" 
 
+# Active Keys Storage
 ACTIVE_GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS if k.strip()]
 ACTIVE_SEARCH_KEYS = [k.strip() for k in GOOGLE_SEARCH_KEYS if k.strip()]
 
-# 🔥 KEYWORDS
-ADULT_KEYWORDS = ["sex", "porn", "xxx", "18+", "leak", "viral", "bsw", "အော", "လိုး"]
+# --- 2. THE BRAIN (GEMINI INTELLIGENCE) ---
 
-# --- 2. INTELLIGENT HELPERS ---
+def get_current_time():
+    # Force Myanmar Time
+    utc_now = datetime.now(timezone.utc)
+    mm_time = utc_now + timedelta(hours=6, minutes=30)
+    return mm_time.strftime("%Y-%m-%d (%I:%M %p)")
 
-def get_gemini_content(prompt, image=None):
-    if not ACTIVE_GEMINI_KEYS: return "⚠️ Error: AI Keys missing."
-    shuffled_keys = ACTIVE_GEMINI_KEYS.copy()
-    random.shuffle(shuffled_keys)
+def ask_gemini(prompt, image=None, json_mode=False):
+    """
+    This is the core brain function. It switches keys if one fails.
+    """
+    if not ACTIVE_GEMINI_KEYS: return None
+    random.shuffle(ACTIVE_GEMINI_KEYS)
 
-    for key in shuffled_keys:
+    for key in ACTIVE_GEMINI_KEYS:
         try:
             genai.configure(api_key=key)
             model = genai.GenerativeModel(MODEL_NAME)
+
+            # If JSON mode is requested, we force JSON structure in prompt
+            if json_mode:
+                prompt += "\n\nRETURN JSON ONLY. NO MARKDOWN."
+
             content = [prompt, image] if image else prompt
             response = model.generate_content(content)
+
+            if json_mode:
+                # Clean up markdown code blocks to extract pure JSON
+                text = response.text.replace("```json", "").replace("```", "").strip()
+                return json.loads(text)
+
             return response.text
-        except: continue
-    return "⚠️ System Busy (AI Overload)."
+        except Exception as e:
+            print(f"Key Error ({key[:5]}...): {e}")
+            continue
+    return None
 
-def execute_google_search(query, fresh=False, only_telegram=False, strict_adult=False):
-    if not GOOGLE_CX_ID or not ACTIVE_SEARCH_KEYS: return None, []
+# --- 3. THE HANDS (TOOLS) ---
 
-    shuffled_keys = ACTIVE_SEARCH_KEYS.copy()
-    random.shuffle(shuffled_keys)
+def tool_google_search(query, search_type="general"):
+    """
+    Smart Search Tool that auto-filters garbage dates.
+    """
+    if not ACTIVE_SEARCH_KEYS or not GOOGLE_CX_ID: return None, []
 
-    for key in shuffled_keys:
+    random.shuffle(ACTIVE_SEARCH_KEYS)
+    for key in ACTIVE_SEARCH_KEYS:
         try:
-            url = "https://www.googleapis.com/customsearch/v1"
-            params = {'q': query, 'key': key, 'cx': GOOGLE_CX_ID, 'safe': 'off'}
-            if fresh: params['dateRestrict'] = 'd1' # Last 24 hours
+            params = {
+                'q': query, 'key': key, 'cx': GOOGLE_CX_ID, 'safe': 'off'
+            }
 
-            response = requests.get(url, params=params)
-            if response.status_code != 200: continue
+            # 🔥 STRICT RULE: For Prices & News, force 24-hour freshness
+            if search_type in ["PRICE", "NEWS"]:
+                params['dateRestrict'] = 'd1'
 
-            res = response.json()
-            if 'items' in res:
-                text_out = ""
-                links = []
-                for item in res['items']:
-                    title = item.get('title', '')
-                    link = item.get('link', '')
-                    snippet = item.get('snippet', '').lower()
+            response = requests.get("https://www.googleapis.com/customsearch/v1", params=params)
+            data = response.json()
 
-                    # 1. Telegram Filter
-                    if only_telegram:
-                        if "t.me" not in link: continue
-                        link = link.replace("/s/", "/")
-                        if "Telegram: Contact" in title and len(snippet) < 10: continue
+            if 'items' not in data: continue
 
-                    # 2. Strict Adult Filter
-                    full_text = (title + " " + snippet).lower()
-                    if strict_adult and not any(k in full_text for k in ADULT_KEYWORDS):
-                        continue
+            results_text = ""
+            links = []
 
-                    text_out += f"- Title: {title}\n  Snippet: {snippet}\n  Link: {link}\n\n"
-                    links.append({"title": title, "link": link})
+            for item in data['items']:
+                title = item.get('title', 'No Title')
+                link = item.get('link', '')
+                snippet = item.get('snippet', '')
 
-                if only_telegram and not links: return "", []
-                return text_out, links
+                # Filter Logic based on Type
+                if search_type == "LINK_TELEGRAM":
+                    if "t.me" not in link: continue
+                    if "Telegram: Contact" in title and len(snippet) < 15: continue
+
+                results_text += f"SOURCE: {title}\nDETAILS: {snippet}\nLINK: {link}\n\n"
+                links.append({'title': title, 'link': link})
+
+            return results_text, links
         except: continue
-    return "", []
+    return None, []
 
-def tool_image_gen(prompt):
+def tool_image_generator(prompt):
     return f"https://image.pollinations.ai/prompt/{prompt}"
 
-# --- 3. THE SMART BRAIN ---
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_text = update.message.text
-    if not user_text and not update.message.photo: return
+# --- 4. THE AUTONOMOUS AGENT LOGIC ---
 
-    # 1. Vision (Eyes)
+async def agent_core(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    user_id = update.effective_user.id
+    timestamp = get_current_time()
+
+    # --- A. VISION INPUT ---
     if update.message.photo:
         await update.message.reply_chat_action(constants.ChatAction.TYPING)
-        caption = update.message.caption if update.message.caption else "Analyze this"
-        try:
-            photo_file = await update.message.photo[-1].get_file()
-            photo_bytes = await photo_file.download_as_bytearray()
-            img_data = Image.open(io.BytesIO(photo_bytes))
+        caption = update.message.caption if update.message.caption else "Analyze this image"
 
-            # Smart Analysis
-            analysis = get_gemini_content([f"User: {caption}. Analyze deeply and reply in Burmese.", img_data])
-            await update.message.reply_text(analysis)
-        except: await update.message.reply_text("❌ Vision Error")
+        photo_file = await update.message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        img_data = Image.open(io.BytesIO(photo_bytes))
+
+        analysis = ask_gemini(f"User sent image. Context: {caption}. Analyze and reply in Burmese.", img_data)
+        await update.message.reply_text(analysis if analysis else "❌ Error analyzing image.")
         return
 
-    # 2. Text Analysis (Brain)
+    if not user_text: return
     await update.message.reply_chat_action(constants.ChatAction.TYPING)
 
-    # Check "Intent" - What does the user REALLY want?
-    # We ask Gemini to think first.
+    # --- B. INTENT ANALYSIS (THE BRAIN) ---
+    # We ask Gemini to decide what to do instead of using 'if' statements.
 
-    intent_prompt = f"""
-    You are a smart assistant. User Input: "{user_text}"
-    Current Time: {datetime.now(timezone(timedelta(hours=6, minutes=30))).strftime("%Y-%m-%d %I:%M %p")}
+    brain_prompt = f"""
+    You are the "Master Control" of a Telegram Bot.
+    Current Time (Myanmar): {timestamp}
+    User Input: "{user_text}"
 
-    Analyze the intent. Return ONLY the JSON:
+    TASK: Analyze user intent and output a JSON decision.
+
+    INTENT CATEGORIES:
+    1. "PRICE_CHECK" -> If user asks for Gold, USD, Currency, Fuel prices.
+    2. "LINK_FINDER" -> If user asks for Movie, Series, Channel, 18+, MMSUB links.
+       - set "is_adult": true if keywords (sex, porn, leak, viral, 18+) are present.
+    3. "NEWS_UPDATE" -> If user asks for News/Events.
+    4. "IMAGE_GEN" -> If user asks to Draw/Create image.
+    5. "CHAT" -> General conversation.
+
+    JSON FORMAT:
     {{
-        "action": "SEARCH_PRICE" | "SEARCH_LINK" | "SEARCH_NEWS" | "GEN_IMAGE" | "CHAT",
-        "query": "refined search query or prompt",
-        "strict_adult": true/false (if user explicitly asks for 18+)
+        "intent": "PRICE_CHECK" | "LINK_FINDER" | "NEWS_UPDATE" | "IMAGE_GEN" | "CHAT",
+        "search_query": "Optimized Google search query based on user input",
+        "is_adult": true/false
     }}
     """
 
-    try:
-        raw_decision = get_gemini_content(intent_prompt)
-        decision = json.loads(re.search(r'\{.*\}', raw_decision, re.DOTALL).group())
-    except:
-        decision = {"action": "CHAT", "query": user_text, "strict_adult": False}
+    decision = ask_gemini(brain_prompt, json_mode=True)
 
-    action = decision.get("action")
-    query = decision.get("query")
-    is_strict = decision.get("strict_adult")
+    if not decision:
+        await update.message.reply_text("⚠️ Brain Error: I couldn't think.")
+        return
 
-    # --- EXECUTION PHASE ---
+    intent = decision.get("intent")
+    query = decision.get("search_query")
+    is_adult = decision.get("is_adult", False)
 
-    # 🧠 CASE 1: INTELLIGENT PRICE ANALYSIS
-    if action == "SEARCH_PRICE":
-        await update.message.reply_text(f"📉 ဈေးကွက်ကို လေ့လာသုံးသပ်နေသည်: {query}...")
+    print(f"🤖 DECISION: {intent} | Query: {query} | Adult: {is_adult}")
 
-        # We search specifically for external/black market
-        search_q = f"Myanmar external market price {query} black market today real update"
-        raw_data, _ = execute_google_search(search_q)
+    # --- C. EXECUTION PHASE ---
+
+    # 1. PRICE CHECK AGENT
+    if intent == "PRICE_CHECK":
+        await update.message.reply_text(f"📉 ဈေးနှုန်းစိစစ်နေသည် (Date: {timestamp})...")
+
+        # We enforce "Market Price" search keywords
+        final_query = f"{query} market price Myanmar {timestamp} black market"
+        raw_data, _ = tool_google_search(final_query, search_type="PRICE")
 
         if not raw_data:
-            await update.message.reply_text("❌ Data မတွေ့ပါ။")
+            await update.message.reply_text("❌ ဒီနေ့အတွက် Data အသစ်မတွေ့ပါ။")
         else:
-            # 🔥 THE "GEMINI" TOUCH: Analyze raw data like a human
-            analysis_prompt = f"""
-            Here is raw search data about Myanmar Market Prices:
-            {raw_data}
+            # Re-Analyze data to remove old dates
+            analyst_prompt = f"""
+            You are a Market Analyst.
+            Raw Data: {raw_data}
+            Current Time: {timestamp}
 
-            USER QUESTION: "{user_text}"
-
-            TASK: 
-            1. Identify the 'External/Black Market' price (usually higher).
-            2. Identify 'YGEA/Official' price (usually lower).
-            3. If data is messy, ESTIMATE the most likely real trading price based on trends.
-            4. Reply in Burmese like a smart market analyst. (Don't just list numbers, explain slightly).
+            Task: Extract ONLY valid prices for TODAY/YESTERDAY.
+            - Ignore "Official Rate". Find "External/Black Market Rate".
+            - Ignore data older than 24 hours.
+            - Reply in Burmese format.
             """
-            final_reply = get_gemini_content(analysis_prompt)
-            await update.message.reply_text(final_reply, parse_mode='Markdown')
+            final_response = ask_gemini(analyst_prompt)
+            await update.message.reply_text(final_response, parse_mode='Markdown')
 
-    # 🧠 CASE 2: SMART LINK FINDER
-    elif action == "SEARCH_LINK":
-        search_type = "(sex OR porn OR leak)" if is_strict else "(channel OR 1080p OR mmsub)"
-        final_query = f'site:t.me "{query}" {search_type}'
+    # 2. LINK FINDER AGENT
+    elif intent == "LINK_FINDER":
+        await update.message.reply_text(f"🔍 Link ရှာနေသည် ({'18+' if is_adult else 'Safe'})...")
 
-        await update.message.reply_text(f"🔍 Link ရှာဖွေမှု စတင်နေပြီ: {query}...")
-        _, links = execute_google_search(final_query, fresh=False, only_telegram=True, strict_adult=is_strict)
-
-        if not links:
-             # Fallback
-             _, links = execute_google_search(f'site:t.me {query}', fresh=False, only_telegram=True)
-
-        if not links:
-            await update.message.reply_text("❌ လိုချင်သော Link အစစ်အမှန် မတွေ့ရှိပါ။")
+        if is_adult:
+            final_query = f'site:t.me "{query}" (leak OR viral OR sex OR porn)'
         else:
-            # Let Gemini verify if these look like good links (Optional, but let's stick to buttons for speed)
-            buttons = [[InlineKeyboardButton(f"🔗 {item['title'][:40]}", url=item['link'])] for item in links[:6]]
-            await update.message.reply_text(f"တွေ့ရှိရသော အကောင်းဆုံး Links များ:", reply_markup=InlineKeyboardMarkup(buttons))
+            final_query = f'site:t.me "{query}" (channel OR mmsub OR 1080p)'
 
-    # 🧠 CASE 3: NEWS SUMMARY
-    elif action == "SEARCH_NEWS":
-        await update.message.reply_text(f"📰 သတင်းများကို ဖတ်ရှုနေသည်...")
-        raw_data, _ = execute_google_search(f"Myanmar news {query} latest", fresh=True)
+        _, links = tool_google_search(final_query, search_type="LINK_TELEGRAM")
 
-        if not raw_data:
+        # Strict Filter
+        valid_links = []
+        for l in links:
+            title_lower = l['title'].lower()
+            # If Adult requested, Title MUST sound adult
+            if is_adult:
+                if any(k in title_lower for k in ["sex", "porn", "leak", "viral", "အော", "လိုး"]):
+                    valid_links.append(l)
+            else:
+                # If Safe requested, remove obvious adult titles
+                if not any(k in title_lower for k in ["sex", "porn"]):
+                    valid_links.append(l)
+
+        if valid_links:
+            buttons = [[InlineKeyboardButton(f"🔗 {item['title'][:30]}", url=item['link'])] for item in valid_links[:6]]
+            await update.message.reply_text(f"တွေ့ရှိသော Links များ:", reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            await update.message.reply_text("❌ Link အစစ်အမှန် မတွေ့ရှိပါ။")
+
+    # 3. NEWS AGENT
+    elif intent == "NEWS_UPDATE":
+        await update.message.reply_text("📰 သတင်းဖတ်နေသည်...")
+        raw_data, _ = tool_google_search(f"{query} latest", search_type="NEWS")
+
+        if raw_data:
+            news_prompt = f"Summarize these latest Myanmar news events into a short Burmese report. Ignore old news.\nData: {raw_data}"
+            final_response = ask_gemini(news_prompt)
+            await update.message.reply_text(final_response, parse_mode='Markdown')
+        else:
             await update.message.reply_text("❌ သတင်းထူး မတွေ့ပါ။")
-        else:
-            summary_prompt = f"""
-            Raw News Data: {raw_data}
-            User Topic: {user_text}
 
-            TASK: Summarize the TRUTH. Identify rumors vs facts if possible.
-            Reply in Burmese as a News Anchor.
-            """
-            final_reply = get_gemini_content(summary_prompt)
-            await update.message.reply_text(final_reply, parse_mode='Markdown')
-
-    # 🧠 CASE 4: IMAGE
-    elif action == "GEN_IMAGE":
+    # 4. ARTIST AGENT
+    elif intent == "IMAGE_GEN":
         await update.message.reply_text("🎨 ပုံဖန်တီးနေသည်...")
-        await update.message.reply_photo(tool_image_gen(query))
+        image_url = tool_image_generator(query)
+        await update.message.reply_photo(image_url)
 
-    # 🧠 CASE 5: PURE INTELLIGENT CHAT
+    # 5. CHAT AGENT
     else:
-        # Just talk like Gemini
-        chat_prompt = f"""
-        User said: "{user_text}"
-        Act as 'Gemini', a helpful, smart, and friendly AI assistant.
-        Reply in Burmese naturally.
-        """
-        reply = get_gemini_content(chat_prompt)
-        await update.message.reply_text(reply, parse_mode='Markdown')
+        chat_prompt = f"User said: {user_text}\nReply as a smart AI assistant in Burmese."
+        response = ask_gemini(chat_prompt)
+        await update.message.reply_text(response, parse_mode='Markdown')
+
+# --- 5. INITIALIZATION ---
 
 if __name__ == '__main__':
     keep_alive()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
-    print("Smart Bot Started...")
-    app.run_polling()
+
+    if not BOT_TOKEN:
+        print("❌ Error: TELERAM_TOKEN missing.")
+    else:
+        print("✅ AI AUTONOMOUS AGENT STARTED...")
+        app = ApplicationBuilder().token(BOT_TOKEN).build()
+        app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, agent_core))
+        app.run_polling()

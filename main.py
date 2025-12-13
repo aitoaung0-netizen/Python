@@ -1,269 +1,308 @@
-import logging
 import os
-import random
-import json
-import re
+import logging
 import requests
+import re
+import time
 import io
-import asyncio
-from datetime import datetime, timedelta, timezone
-from PIL import Image
-import google.generativeai as genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
+import random
+import sqlite3
+import json
+from threading import Thread
+from flask import Flask
+from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
-from keep_alive import keep_alive
+import google.generativeai as genai
+from gtts import gTTS
+from bs4 import BeautifulSoup
+from youtube_transcript_api import YouTubeTranscriptApi
+from datetime import datetime
 
-# --- 1. SYSTEM CONFIGURATION ---
-# Load Environment Variables
-GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
-GOOGLE_SEARCH_KEYS = os.environ.get("GOOGLE_SEARCH_API_KEYS", "").split(",")
-GOOGLE_CX_ID = os.environ.get("GOOGLE_CX_ID", "")
-BOT_TOKEN = os.environ.get("TELERAM_TOKEN")
+# --- SAFE CREATION TOOLS ---
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import qrcode
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
 
-# Setup Logging & Model
-logging.basicConfig(level=logging.INFO)
-MODEL_NAME = "gemini-2.5-flash" 
+# --- 1. WEB SERVER & CONFIGS ---
+app = Flask('')
+@app.route('/')
+def home(): return "🤖 MEMORY BOT ONLINE!"
+def run_http(): app.run(host='0.0.0.0', port=8080)
+def keep_alive():
+    t = Thread(target=run_http)
+    t.start()
 
-# Active Keys Storage
-ACTIVE_GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS if k.strip()]
-ACTIVE_SEARCH_KEYS = [k.strip() for k in GOOGLE_SEARCH_KEYS if k.strip()]
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GOOGLE_CX_ID = os.getenv("GOOGLE_CX_ID")
+GEMINI_KEYS = os.getenv("GEMINI_API_KEYS").split(',') if os.getenv("GEMINI_API_KEYS") else []
+SEARCH_KEYS = os.getenv("GOOGLE_SEARCH_API_KEYS").split(',') if os.getenv("GOOGLE_SEARCH_API_KEYS") else []
+ADMIN_ID = 6780671216  # <--- Change this to your ID
 
-# --- 2. THE BRAIN (GEMINI INTELLIGENCE) ---
+# --- 2. DATABASE SETUP (Long Term Memory) ---
+# Replit/Render မှာ ဖိုင်တွေက Restart ချရင် ပျောက်တတ်လို့
+# SQLite ကို သုံးပြီး စနစ်တကျ သိမ်းပါမယ်။
+conn = sqlite3.connect('bot_memory.db', check_same_thread=False)
+c = conn.cursor()
 
-def get_current_time():
-    # Force Myanmar Time
-    utc_now = datetime.now(timezone.utc)
-    mm_time = utc_now + timedelta(hours=6, minutes=30)
-    return mm_time.strftime("%Y-%m-%d (%I:%M %p)")
+# ဇယားများ တည်ဆောက်ခြင်း
+# ૧။ Chat History (စကားပြော မှတ်တမ်း)
+c.execute('''CREATE TABLE IF NOT EXISTS chat_logs 
+             (user_id INTEGER, role TEXT, content TEXT, timestamp DATETIME)''')
 
-def ask_gemini(prompt, image=None, json_mode=False):
-    """
-    This is the core brain function. It switches keys if one fails.
-    """
-    if not ACTIVE_GEMINI_KEYS: return None
-    random.shuffle(ACTIVE_GEMINI_KEYS)
+# ၂။ Media Context (ပုံ/ဗီဒီယို မှတ်တမ်း) - ပုံပို့ပြီး ကြာမှ ပြန်မေးရင် သိအောင်
+c.execute('''CREATE TABLE IF NOT EXISTS media_logs 
+             (user_id INTEGER, type TEXT, description TEXT, timestamp DATETIME)''')
+conn.commit()
 
-    for key in ACTIVE_GEMINI_KEYS:
-        try:
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel(MODEL_NAME)
+def save_chat(user_id, role, content):
+    c.execute("INSERT INTO chat_logs VALUES (?, ?, ?, ?)", (user_id, role, content, datetime.now()))
+    conn.commit()
 
-            # If JSON mode is requested, we force JSON structure in prompt
-            if json_mode:
-                prompt += "\n\nRETURN JSON ONLY. NO MARKDOWN."
+def save_media(user_id, media_type, description):
+    c.execute("INSERT INTO media_logs VALUES (?, ?, ?, ?)", (user_id, media_type, description, datetime.now()))
+    conn.commit()
 
-            content = [prompt, image] if image else prompt
-            response = model.generate_content(content)
+def get_recent_context(user_id, limit=5):
+    # နောက်ဆုံး ပြောခဲ့တဲ့ စကား ၅ ခွန်း
+    c.execute("SELECT role, content FROM chat_logs WHERE user_id=? ORDER BY timestamp DESC LIMIT ?", (user_id, limit))
+    chats = c.fetchall()[::-1] # Reverse to chronological
 
-            if json_mode:
-                # Clean up markdown code blocks to extract pure JSON
-                text = response.text.replace("```json", "").replace("```", "").strip()
-                return json.loads(text)
+    # နောက်ဆုံး ပို့ခဲ့တဲ့ ပုံ/မီဒီယို အကြောင်းအရာ ၁ ခု (ကြာနေလည်း ပြန်ပါလာမယ်)
+    c.execute("SELECT type, description FROM media_logs WHERE user_id=? ORDER BY timestamp DESC LIMIT 1", (user_id,))
+    media = c.fetchone()
 
-            return response.text
-        except Exception as e:
-            print(f"Key Error ({key[:5]}...): {e}")
-            continue
-    return None
+    context_str = ""
+    if media:
+        context_str += f"[System Note: User previously sent a {media[0]} described as: '{media[1]}']\n"
 
-# --- 3. THE HANDS (TOOLS) ---
+    for chat in chats:
+        context_str += f"{chat[0]}: {chat[1]}\n"
 
-def tool_google_search(query, search_type="general"):
-    """
-    Smart Search Tool that auto-filters garbage dates.
-    """
-    if not ACTIVE_SEARCH_KEYS or not GOOGLE_CX_ID: return None, []
+    return context_str
 
-    random.shuffle(ACTIVE_SEARCH_KEYS)
-    for key in ACTIVE_SEARCH_KEYS:
-        try:
-            params = {
-                'q': query, 'key': key, 'cx': GOOGLE_CX_ID, 'safe': 'off'
-            }
+# --- 3. HELPER FUNCTIONS ---
+def get_random_key(keys): return random.choice(keys).strip() if keys else None
 
-            # 🔥 STRICT RULE: For Prices & News, force 24-hour freshness
-            if search_type in ["PRICE", "NEWS"]:
-                params['dateRestrict'] = 'd1'
+def get_model():
+    key = get_random_key(GEMINI_KEYS)
+    if not key: return None
+    genai.configure(api_key=key)
+    return genai.GenerativeModel('gemini-2.5-flash')
 
-            response = requests.get("https://www.googleapis.com/customsearch/v1", params=params)
-            data = response.json()
+# --- 4. ADVANCED SEARCH (UNRESTRICTED) ---
+def google_search_unrestricted(query, is_18plus=False):
+    key = get_random_key(SEARCH_KEYS)
+    if not key: return "Search Key Error"
 
-            if 'items' not in data: continue
+    try:
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            'key': key,
+            'cx': GOOGLE_CX_ID,
+            'q': query,
+            'num': 5, # ရလဒ် ၅ ခု ရှာမယ်
+            'safe': 'off' # 🔥 SAFE MODE OFF (18+ ရှာလို့ရအောင်)
+        }
 
-            results_text = ""
-            links = []
+        # Channel ရှာခိုင်းရင် t.me ပါမှ ယူမယ်
+        if "channel" in query.lower() or "telegram" in query.lower():
+            params['q'] += " site:t.me" # Telegram Link သီးသန့်ရှာမယ်
 
+        data = requests.get(url, params=params).json()
+
+        results = ""
+        if 'items' in data:
             for item in data['items']:
-                title = item.get('title', 'No Title')
-                link = item.get('link', '')
-                snippet = item.get('snippet', '')
+                title = item['title']
+                link = item['link']
+                snippet = item['snippet']
 
-                # Filter Logic based on Type
-                if search_type == "LINK_TELEGRAM":
-                    if "t.me" not in link: continue
-                    if "Telegram: Contact" in title and len(snippet) < 15: continue
+                # 18+ စစ်ဆေးခြင်း (User လိုချင်တဲ့ Keyword ပါမှ Active ဖြစ်မယ်)
+                if is_18plus:
+                    # Video ပါနိုင်ခြေရှိတဲ့ စကားလုံးတွေပါမှ ရွေးမယ်
+                    if any(x in snippet.lower() or x in title.lower() for x in ['video', 'clip', 'full', 'vids', 'watch']):
+                        results += f"🔞 [Channel]: {link}\nInfo: {snippet}\n\n"
+                else:
+                    results += f"- [{title}]({link}): {snippet}\n"
 
-                results_text += f"SOURCE: {title}\nDETAILS: {snippet}\nLINK: {link}\n\n"
-                links.append({'title': title, 'link': link})
+            return results if results else "သက်ဆိုင်ရာ Channel ရှာမတွေ့ပါ Boss။"
 
-            return results_text, links
-        except: continue
-    return None, []
+        return "No results found."
+    except Exception as e: return f"Search Error: {str(e)}"
 
-def tool_image_generator(prompt):
-    return f"https://image.pollinations.ai/prompt/{prompt}"
+# --- 5. TOOLS (Graph, QR, PDF, Weather) ---
+def create_graph(expression):
+    try:
+        if len(expression) > 30 or "import" in expression: return None
+        x = range(-10, 11)
+        y = [eval(expression.replace('x', str(i)), {"__builtins__": {}}, {}) for i in x]
+        plt.figure(figsize=(6, 4))
+        plt.plot(x, y, marker='o', color='red')
+        plt.grid(True)
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close()
+        return buf
+    except: return None
 
-# --- 4. THE AUTONOMOUS AGENT LOGIC ---
+def create_qrcode(data):
+    qr = qrcode.QRCode(box_size=10, border=4)
+    qr.add_data(data)
+    qr.make(fit=True)
+    buf = io.BytesIO()
+    qr.make_image(fill='black', back_color='white').save(buf)
+    buf.seek(0)
+    return buf
 
-async def agent_core(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
+def create_pdf(text):
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    textobject = c.beginText(40, 750)
+    lines = text[:5000].split('\n')
+    for line in lines: textobject.textLine(line[:90])
+    c.drawText(textobject)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf
+
+# --- 6. HANDLERS ---
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = "😈 **ULTIMATE UNRESTRICTED BOT** 😈\n\n"
+    msg += "✅ **Memory:** ပုံပို့ထားရင် နောက်မှပြန်မေးလည်း သိတယ်။\n"
+    msg += "✅ **Search:** Safe Mode Off ထားတယ်။ 18+ ရှာလို့ရတယ်။\n"
+    msg += "✅ **Channels:** Telegram Link အစစ်တွေပဲ ရှာပေးမယ်။\n"
+    msg += "✅ **Tools:** QR, PDF, Graph, Weather အကုန်ရ။\n"
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    timestamp = get_current_time()
+    user_text = update.message.text
 
-    # --- A. VISION INPUT ---
-    if update.message.photo:
-        await update.message.reply_chat_action(constants.ChatAction.TYPING)
-        caption = update.message.caption if update.message.caption else "Analyze this image"
+    # --- A. MEDIA HANDLING (ပုံ/အသံ ရောက်ရင် DB ထဲ အရင်သိမ်းမယ်) ---
+    if update.message.photo or update.message.voice or update.message.audio:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-        photo_file = await update.message.photo[-1].get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
-        img_data = Image.open(io.BytesIO(photo_bytes))
+        # File Download
+        if update.message.photo:
+            file = await update.message.photo[-1].get_file()
+            fname = f"media_{user_id}.jpg"
+            m_type = "Image"
+        else:
+            file = await update.message.voice.get_file() if update.message.voice else await update.message.audio.get_file()
+            fname = f"media_{user_id}.ogg"
+            m_type = "Audio"
 
-        analysis = ask_gemini(f"User sent image. Context: {caption}. Analyze and reply in Burmese.", img_data)
-        await update.message.reply_text(analysis if analysis else "❌ Error analyzing image.")
+        await file.download_to_drive(fname)
+
+        # Gemini Vision/Audio Analysis
+        model = get_model()
+        if model:
+            try:
+                uploaded_file = genai.upload_file(fname)
+                while uploaded_file.state.name == "PROCESSING": time.sleep(1)
+
+                # AI ကို ဒီဖိုင်အကြောင်း မှတ်တမ်းတင်ခိုင်းမယ်
+                analysis = model.generate_content(["Describe this detailedly in English for future reference.", uploaded_file]).text
+
+                # Database ထဲမှာ မှတ်ဉာဏ်သိမ်းမယ်
+                save_media(user_id, m_type, analysis)
+
+                # User ကို ချက်ချင်းပြန်ဖြေမယ်
+                reply_prompt = "Reply to this media in Burmese naturally."
+                reply = model.generate_content([reply_prompt, uploaded_file]).text
+
+                # အသံဖိုင်ဆိုရင် အသံနဲ့ပြန်မယ်
+                if m_type == "Audio":
+                    try:
+                        tts = gTTS(text=reply, lang='my')
+                        tts.save("tts.ogg")
+                        await context.bot.send_voice(chat_id=chat_id, voice=open("tts.ogg", "rb"))
+                        os.remove("tts.ogg")
+                    except: await context.bot.send_message(chat_id=chat_id, text=reply)
+                else:
+                    await context.bot.send_message(chat_id=chat_id, text=reply)
+
+            except Exception as e:
+                await context.bot.send_message(chat_id=chat_id, text=f"Media Error: {e}")
+
+        if os.path.exists(fname): os.remove(fname)
         return
 
+    # --- B. TEXT & TOOLS HANDLING ---
     if not user_text: return
-    await update.message.reply_chat_action(constants.ChatAction.TYPING)
+    save_chat(user_id, "User", user_text) # Chat Log သိမ်းမယ်
 
-    # --- B. INTENT ANALYSIS (THE BRAIN) ---
-    # We ask Gemini to decide what to do instead of using 'if' statements.
-
-    brain_prompt = f"""
-    You are the "Master Control" of a Telegram Bot.
-    Current Time (Myanmar): {timestamp}
-    User Input: "{user_text}"
-
-    TASK: Analyze user intent and output a JSON decision.
-
-    INTENT CATEGORIES:
-    1. "PRICE_CHECK" -> If user asks for Gold, USD, Currency, Fuel prices.
-    2. "LINK_FINDER" -> If user asks for Movie, Series, Channel, 18+, MMSUB links.
-       - set "is_adult": true if keywords (sex, porn, leak, viral, 18+) are present.
-    3. "NEWS_UPDATE" -> If user asks for News/Events.
-    4. "IMAGE_GEN" -> If user asks to Draw/Create image.
-    5. "CHAT" -> General conversation.
-
-    JSON FORMAT:
-    {{
-        "intent": "PRICE_CHECK" | "LINK_FINDER" | "NEWS_UPDATE" | "IMAGE_GEN" | "CHAT",
-        "search_query": "Optimized Google search query based on user input",
-        "is_adult": true/false
-    }}
-    """
-
-    decision = ask_gemini(brain_prompt, json_mode=True)
-
-    if not decision:
-        await update.message.reply_text("⚠️ Brain Error: I couldn't think.")
+    # 1. Tools Check
+    txt_lower = user_text.lower()
+    if txt_lower.startswith("graph "):
+        buf = create_graph(user_text[6:])
+        if buf: await context.bot.send_photo(chat_id=chat_id, photo=buf)
+        return
+    if txt_lower.startswith("qr "):
+        buf = create_qrcode(user_text[3:])
+        await context.bot.send_photo(chat_id=chat_id, photo=buf)
+        return
+    if txt_lower.startswith("pdf "):
+        buf = create_pdf(user_text[4:])
+        await context.bot.send_document(chat_id=chat_id, document=buf, filename="doc.pdf")
         return
 
-    intent = decision.get("intent")
-    query = decision.get("search_query")
-    is_adult = decision.get("is_adult", False)
+    # 2. Search Logic (18+ & Channels)
+    search_result = ""
+    is_search_needed = any(x in txt_lower for x in ["ရှာ", "search", "link", "channel", "video", "ကား", "news"])
 
-    print(f"🤖 DECISION: {intent} | Query: {query} | Adult: {is_adult}")
+    if is_search_needed:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    # --- C. EXECUTION PHASE ---
+        # 18+ Keywords Check
+        is_adult = any(x in txt_lower for x in ["sex", "porn", "18+", "လိုး", "အော", "စောက်"])
+        search_result = google_search_unrestricted(user_text, is_18plus=is_adult)
 
-    # 1. PRICE CHECK AGENT
-    if intent == "PRICE_CHECK":
-        await update.message.reply_text(f"📉 ဈေးနှုန်းစိစစ်နေသည် (Date: {timestamp})...")
+    # 3. AI Generation with Memory
+    # အရင်မှတ်ဉာဏ် (ပုံ/စာ) တွေကို ပြန်ခေါ်မယ်
+    history_context = get_recent_context(user_id)
 
-        # We enforce "Market Price" search keywords
-        final_query = f"{query} market price Myanmar {timestamp} black market"
-        raw_data, _ = tool_google_search(final_query, search_type="PRICE")
+    model = get_model()
+    if model:
+        prompt = f"""
+        System Context: You are a helpful assistant.
+        User's Memory & Context:
+        {history_context}
 
-        if not raw_data:
-            await update.message.reply_text("❌ ဒီနေ့အတွက် Data အသစ်မတွေ့ပါ။")
-        else:
-            # Re-Analyze data to remove old dates
-            analyst_prompt = f"""
-            You are a Market Analyst.
-            Raw Data: {raw_data}
-            Current Time: {timestamp}
+        Search Results (if any):
+        {search_result}
 
-            Task: Extract ONLY valid prices for TODAY/YESTERDAY.
-            - Ignore "Official Rate". Find "External/Black Market Rate".
-            - Ignore data older than 24 hours.
-            - Reply in Burmese format.
-            """
-            final_response = ask_gemini(analyst_prompt)
-            await update.message.reply_text(final_response, parse_mode='Markdown')
+        User Query: "{user_text}"
 
-    # 2. LINK FINDER AGENT
-    elif intent == "LINK_FINDER":
-        await update.message.reply_text(f"🔍 Link ရှာနေသည် ({'18+' if is_adult else 'Safe'})...")
-
-        if is_adult:
-            final_query = f'site:t.me "{query}" (leak OR viral OR sex OR porn)'
-        else:
-            final_query = f'site:t.me "{query}" (channel OR mmsub OR 1080p)'
-
-        _, links = tool_google_search(final_query, search_type="LINK_TELEGRAM")
-
-        # Strict Filter
-        valid_links = []
-        for l in links:
-            title_lower = l['title'].lower()
-            # If Adult requested, Title MUST sound adult
-            if is_adult:
-                if any(k in title_lower for k in ["sex", "porn", "leak", "viral", "အော", "လိုး"]):
-                    valid_links.append(l)
-            else:
-                # If Safe requested, remove obvious adult titles
-                if not any(k in title_lower for k in ["sex", "porn"]):
-                    valid_links.append(l)
-
-        if valid_links:
-            buttons = [[InlineKeyboardButton(f"🔗 {item['title'][:30]}", url=item['link'])] for item in valid_links[:6]]
-            await update.message.reply_text(f"တွေ့ရှိသော Links များ:", reply_markup=InlineKeyboardMarkup(buttons))
-        else:
-            await update.message.reply_text("❌ Link အစစ်အမှန် မတွေ့ရှိပါ။")
-
-    # 3. NEWS AGENT
-    elif intent == "NEWS_UPDATE":
-        await update.message.reply_text("📰 သတင်းဖတ်နေသည်...")
-        raw_data, _ = tool_google_search(f"{query} latest", search_type="NEWS")
-
-        if raw_data:
-            news_prompt = f"Summarize these latest Myanmar news events into a short Burmese report. Ignore old news.\nData: {raw_data}"
-            final_response = ask_gemini(news_prompt)
-            await update.message.reply_text(final_response, parse_mode='Markdown')
-        else:
-            await update.message.reply_text("❌ သတင်းထူး မတွေ့ပါ။")
-
-    # 4. ARTIST AGENT
-    elif intent == "IMAGE_GEN":
-        await update.message.reply_text("🎨 ပုံဖန်တီးနေသည်...")
-        image_url = tool_image_generator(query)
-        await update.message.reply_photo(image_url)
-
-    # 5. CHAT AGENT
-    else:
-        chat_prompt = f"User said: {user_text}\nReply as a smart AI assistant in Burmese."
-        response = ask_gemini(chat_prompt)
-        await update.message.reply_text(response, parse_mode='Markdown')
-
-# --- 5. INITIALIZATION ---
+        Instructions:
+        1. If showing news, summarize it (Do not just show links).
+        2. If providing Telegram channels, ensure links start with 't.me/'.
+        3. If 18+ content is requested, provide the found links directly.
+        4. If user asks about a previous photo/media, use the 'User's Memory' section to answer (e.g., "That movie was X").
+        5. Answer in Burmese.
+        """
+        try:
+            response = model.generate_content(prompt)
+            reply_text = response.text
+            save_chat(user_id, "Bot", reply_text) # Bot အဖြေကိုလည်း မှတ်ထားမယ်
+            await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.MARKDOWN)
+        except:
+            await context.bot.send_message(chat_id=chat_id, text="System Busy.")
 
 if __name__ == '__main__':
     keep_alive()
-
-    if not BOT_TOKEN:
-        print("❌ Error: TELERAM_TOKEN missing.")
+    if not TELEGRAM_TOKEN: print("Token Missing")
     else:
-        print("✅ AI AUTONOMOUS AGENT STARTED...")
-        app = ApplicationBuilder().token(BOT_TOKEN).build()
-        app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, agent_core))
+        app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        app.add_handler(CommandHandler('start', start))
+        app.add_handler(MessageHandler(filters.ALL, handle_message))
+        print("MEMORY + UNRESTRICTED BOT RUNNING...")
         app.run_polling()

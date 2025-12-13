@@ -1,6 +1,11 @@
 python-telegram-bot
 google-generativeai
-requests
-Pillow
-telegram
 flask
+requests
+beautifulsoup4
+gTTS
+pillow
+youtube-transcript-api
+matplotlib
+qrcode
+reportlab

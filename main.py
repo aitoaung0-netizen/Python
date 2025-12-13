@@ -17,7 +17,6 @@ from gtts import gTTS
 from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
 from datetime import datetime
-from urllib.parse import urlparse
 
 # --- SAFE CREATION TOOLS ---
 import matplotlib
@@ -27,21 +26,27 @@ import qrcode
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 
-# --- 1. WEB SERVER ---
+# --- 1. WEB SERVER (Render Keep-Alive) ---
 app = Flask('')
 @app.route('/')
-def home(): return "🤖 DIRECT LINK BOT ONLINE!"
+def home(): return "🤖 FINAL BOT IS RUNNING!"
 def run_http(): app.run(host='0.0.0.0', port=8080)
 def keep_alive():
     t = Thread(target=run_http)
     t.start()
 
-# --- 2. CONFIGS ---
+# --- 2. CONFIGS (HARDCODED) ---
+
+# Boss ပေးထားတဲ့ Token (Code ထဲမှာ တိုက်ရိုက်ထည့်ထားပါသည်)
 TELEGRAM_TOKEN = "7778399973:AAFSMO3iMBhxb0CG6OOd09lJ7AgBH6CqT_o"
+
+# Boss ပေးထားတဲ့ Admin ID
+ADMIN_ID = 6780671216
+
+# ကျန်တဲ့ Key တွေကိုတော့ Environment ထဲက ယူပါမယ် (Render မှာ ထည့်ထားဖို့ လိုပါတယ်)
 GOOGLE_CX_ID = os.getenv("GOOGLE_CX_ID")
 GEMINI_KEYS = os.getenv("GEMINI_API_KEYS").split(',') if os.getenv("GEMINI_API_KEYS") else []
 SEARCH_KEYS = os.getenv("GOOGLE_SEARCH_API_KEYS").split(',') if os.getenv("GOOGLE_SEARCH_API_KEYS") else []
-ADMIN_ID = 6780671216  # <--- Change to your ID
 
 # --- 3. DATABASE (MEMORY) ---
 conn = sqlite3.connect('bot_memory.db', check_same_thread=False)
@@ -51,22 +56,28 @@ c.execute('''CREATE TABLE IF NOT EXISTS media_logs (user_id INTEGER, type TEXT, 
 conn.commit()
 
 def save_chat(user_id, role, content):
-    c.execute("INSERT INTO chat_logs VALUES (?, ?, ?, ?)", (user_id, role, content, datetime.now()))
-    conn.commit()
+    try:
+        c.execute("INSERT INTO chat_logs VALUES (?, ?, ?, ?)", (user_id, role, content, datetime.now()))
+        conn.commit()
+    except: pass
 
 def save_media(user_id, media_type, description):
-    c.execute("INSERT INTO media_logs VALUES (?, ?, ?, ?)", (user_id, media_type, description, datetime.now()))
-    conn.commit()
+    try:
+        c.execute("INSERT INTO media_logs VALUES (?, ?, ?, ?)", (user_id, media_type, description, datetime.now()))
+        conn.commit()
+    except: pass
 
 def get_recent_context(user_id, limit=5):
-    c.execute("SELECT role, content FROM chat_logs WHERE user_id=? ORDER BY timestamp DESC LIMIT ?", (user_id, limit))
-    chats = c.fetchall()[::-1]
-    c.execute("SELECT type, description FROM media_logs WHERE user_id=? ORDER BY timestamp DESC LIMIT 1", (user_id,))
-    media = c.fetchone()
-    context_str = ""
-    if media: context_str += f"[User sent {media[0]}: '{media[1]}']\n"
-    for chat in chats: context_str += f"{chat[0]}: {chat[1]}\n"
-    return context_str
+    try:
+        c.execute("SELECT role, content FROM chat_logs WHERE user_id=? ORDER BY timestamp DESC LIMIT ?", (user_id, limit))
+        chats = c.fetchall()[::-1]
+        c.execute("SELECT type, description FROM media_logs WHERE user_id=? ORDER BY timestamp DESC LIMIT 1", (user_id,))
+        media = c.fetchone()
+        context_str = ""
+        if media: context_str += f"[User previously sent {media[0]}: '{media[1]}']\n"
+        for chat in chats: context_str += f"{chat[0]}: {chat[1]}\n"
+        return context_str
+    except: return ""
 
 # --- 4. HELPER FUNCTIONS ---
 def get_random_key(keys): return random.choice(keys).strip() if keys else None
@@ -75,12 +86,12 @@ def get_model():
     key = get_random_key(GEMINI_KEYS)
     if not key: return None
     genai.configure(api_key=key)
-    return genai.GenerativeModel('gemini-2.5-flash')
+    return genai.GenerativeModel('gemini-1.5-flash')
 
-# --- 5. ADVANCED SEARCH (DIRECT LINKS ONLY) ---
+# --- 5. ADVANCED SEARCH (DIRECT & 18+) ---
 def google_search_direct(query, is_18plus=False):
     key = get_random_key(SEARCH_KEYS)
-    if not key: return "Search Key Error"
+    if not key: return "Search Key Error (Check Render Environment)"
 
     try:
         url = "https://www.googleapis.com/customsearch/v1"
@@ -88,11 +99,11 @@ def google_search_direct(query, is_18plus=False):
             'key': key,
             'cx': GOOGLE_CX_ID,
             'q': query,
-            'num': 7, # ပိုရှာမယ်၊ ပြီးမှ စစ်ထုတ်မယ်
-            'safe': 'off' # SafeSearch OFF
+            'num': 7,
+            'safe': 'off' # SafeSearch OFF for 18+
         }
 
-        # Telegram Channel ရှာချင်ရင် t.me ကို Force လုပ်မယ်
+        # Telegram Channel Specific Search
         is_channel_search = any(x in query.lower() for x in ["channel", "telegram", "group", "ချန်နယ်", "ဂရု"])
         if is_channel_search:
             params['q'] += " site:t.me"
@@ -108,31 +119,27 @@ def google_search_direct(query, is_18plus=False):
                 title = item['title']
                 snippet = item['snippet']
 
-                # Filter 1: Telegram Channels
                 if is_channel_search:
                     if "t.me/" in link:
-                        # /s/ (Preview link) ကို ဖျက်ပြီး Direct Link လုပ်မယ်
+                        # Clean /s/ for direct join
                         direct_link = link.replace("/s/", "/")
-                        # Post link (t.me/user/123) မဟုတ်ဘဲ Channel link (t.me/user) ကို ဦးစားပေးမယ်
                         results += f"🔗 **{title}**\nDirect Link: {direct_link}\n\n"
                         found_links += 1
 
-                # Filter 2: 18+ Direct Pages
                 elif is_18plus:
-                    # Video keyword ပါမှ ယူမယ်
-                    if any(x in snippet.lower() + title.lower() for x in ['video', 'watch', 'full', 'streaming', 'porn', 'sex']):
+                    # Filter for video content pages
+                    if any(x in snippet.lower() + title.lower() for x in ['video', 'watch', 'full', 'streaming', 'porn', 'sex', 'x', 'clips']):
                         results += f"🔞 **{title}**\nLink: {link}\n\n"
                         found_links += 1
 
-                # Normal Search
                 else:
                     results += f"- [{title}]({link}): {snippet}\n"
                     found_links += 1
 
-        if found_links == 0: return "တိုက်ရိုက် Link ရှာမတွေ့ပါ Boss။"
+        if found_links == 0: return "No direct links found."
         return results
 
-    except Exception as e: return f"Error: {str(e)}"
+    except Exception as e: return f"Search Error: {str(e)}"
 
 # --- 6. TOOLS ---
 def create_graph(expression):
@@ -175,11 +182,11 @@ def create_pdf(text):
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "☢️ **DIRECT LINK BOT ONLINE** ☢️\n\n"
-    msg += "🔗 **Channels:** `t.me` Direct Link အစစ်ပဲ ပေးမယ်။\n"
-    msg += "🔞 **18+:** Safe Mode ပိတ်ထားတယ်။\n"
-    msg += "🧠 **Memory:** ပုံဟောင်း/အသံဟောင်းတွေကို မှတ်မိတယ်။\n"
-    msg += "🛠️ **Tools:** QR, Graph, PDF, Weather.\n"
+    msg = "☢️ **FINAL BOT ONLINE** ☢️\n\n"
+    msg += "🆔 **Admin ID:** Confirmed\n"
+    msg += "🔗 **Search:** Direct Links & 18+ Enabled\n"
+    msg += "🧠 **Memory:** Active\n"
+    msg += "🛠️ **Tools:** Graph, QR, PDF\n"
     await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -187,7 +194,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text
 
-    # --- A. MEDIA LOGGING (DB SAVE) ---
+    # Debug Print to Console
+    print(f"📩 Recieved: {user_text if user_text else 'Media File'}")
+
+    # --- A. MEDIA HANDLING ---
     if update.message.photo or update.message.voice or update.message.audio:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
@@ -208,12 +218,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 up_file = genai.upload_file(fname)
                 while up_file.state.name == "PROCESSING": time.sleep(1)
 
-                # 1. Analyze for DB (Future Memory)
-                desc = model.generate_content(["Describe this detail in English.", up_file]).text
+                # DB Save
+                desc = model.generate_content(["Describe detailedly in English for database.", up_file]).text
                 save_media(user_id, m_type, desc)
 
-                # 2. Reply to User Now
-                reply = model.generate_content(["Reply in Burmese naturally.", up_file]).text
+                # Reply
+                reply = model.generate_content(["Reply in Burmese.", up_file]).text
 
                 if m_type == "Audio":
                     try:
@@ -226,17 +236,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(chat_id=chat_id, text=reply)
 
             except Exception as e:
-                await context.bot.send_message(chat_id=chat_id, text=f"Error: {e}")
+                print(f"Media Error: {e}")
+                await context.bot.send_message(chat_id=chat_id, text="Media Error.")
 
         if os.path.exists(fname): os.remove(fname)
         return
 
-    # --- B. TEXT & SEARCH ---
+    # --- B. TEXT & TOOLS ---
     if not user_text: return
     save_chat(user_id, "User", user_text)
 
-    # Check Tools
     txt_lower = user_text.lower()
+
+    # Tools
     if txt_lower.startswith("graph "):
         buf = create_graph(user_text[6:])
         if buf: await context.bot.send_photo(chat_id=chat_id, photo=buf)
@@ -250,7 +262,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_document(chat_id=chat_id, document=buf, filename="doc.pdf")
         return
 
-    # Check Search Requirement
+    # Admin Broadcast
+    if txt_lower.startswith("/broadcast") and user_id == ADMIN_ID:
+        # Simple Broadcast logic for now
+        await context.bot.send_message(chat_id=chat_id, text="Admin Broadcast Sent (Simulation).")
+        return
+
+    # Search
     search_res = ""
     is_search = any(x in txt_lower for x in ["ရှာ", "search", "link", "channel", "video", "ကား", "news"])
 
@@ -264,20 +282,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = get_model()
     if model:
         prompt = f"""
-        User Context & Memory:
+        User Memory:
         {history}
 
         Search Results (Direct Links):
         {search_res}
 
-        User Input: "{user_text}"
+        Query: "{user_text}"
 
         Instructions:
-        1. If Search Results contain 'Direct Link', output them EXACTLY as shown.
-        2. Do NOT change t.me links.
-        3. If news, summarize the content (don't just show link).
-        4. If answering from memory (about past image), refer to the User Context.
-        5. Answer in Burmese.
+        1. If Search Results exist, show them EXACTLY (Do not change t.me links).
+        2. If news, summarize.
+        3. If asking about past media, check User Memory.
+        4. Answer in Burmese.
         """
         try:
             response = model.generate_content(prompt)
@@ -285,14 +302,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_chat(user_id, "Bot", reply)
             await context.bot.send_message(chat_id=chat_id, text=reply, parse_mode=ParseMode.MARKDOWN)
         except:
-            await context.bot.send_message(chat_id=chat_id, text="System Busy.")
+            await context.bot.send_message(chat_id=chat_id, text="Busy.")
 
 if __name__ == '__main__':
     keep_alive()
-    if not TELEGRAM_TOKEN: print("Token Missing")
+    if not TELEGRAM_TOKEN:
+        print("ERROR: Token is missing!")
     else:
+        print(f"Bot starting with Token: {TELEGRAM_TOKEN[:10]}...")
         app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
         app.add_handler(CommandHandler('start', start))
         app.add_handler(MessageHandler(filters.ALL, handle_message))
-        print("DIRECT LINK BOT RUNNING...")
-        app.run_polling()
+
+        # Webhook အဟောင်းတွေ ပိတ်မိနေရင် ရှင်းထုတ်ဖို့
+        print("Polling started...")
+        app.run_polling(drop_pending_updates=True)

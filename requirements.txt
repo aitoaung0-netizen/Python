@@ -9,3 +9,4 @@ youtube-transcript-api
 matplotlib
 qrcode
 reportlab
+telegram

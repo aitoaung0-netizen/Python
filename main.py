@@ -13,7 +13,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 import google.generativeai as genai
 
 # --- 1. CONFIGS ---
-TELEGRAM_TOKEN = "7778399973:AAFSMO3iMBhxb0CG6OOd09lJ7AgBH6CqT_o"
+TELEGRAM_TOKEN = "7778399973:AAEH2BU6hBHUqseWfdw2kNcX_OFZNYoFoes"
 ADMIN_ID = 6780671216
 GOOGLE_CX_ID = os.getenv("GOOGLE_CX_ID")
 GEMINI_KEY = os.getenv("GEMINI_API_KEYS").split(',')[0] # Key တစ်ခုတည်းနဲ့ လုံလောက်ပါတယ်
